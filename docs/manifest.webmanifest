@@ -1,0 +1,14 @@
+{
+  "name": "Blackjack Trainer · By the Book",
+  "short_name": "BJ Trainer",
+  "description": "Learn blackjack basic strategy, Hi-Lo card counting, and bankroll management.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#064a27",
+  "theme_color": "#064a27",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

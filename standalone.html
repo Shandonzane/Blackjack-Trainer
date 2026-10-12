@@ -1,0 +1,1213 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Blackjack Trainer · By the Book (standalone)</title>
+
+  <!-- Zero-install build: CDN React + Tailwind + in-browser Babel.
+       This mirrors the modular src/ project in a single openable file.
+       For development, prefer `npm run dev` on the Vite project. -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    html, body, #root { height: 100%; }
+    body { margin: 0; background: #064a27; -webkit-tap-highlight-color: transparent; }
+    @keyframes dealIn { from { opacity: 0; transform: translateY(-12px) scale(.9); } to { opacity: 1; transform: none; } }
+    .animate-deal { animation: dealIn .25s ease-out; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- Source kept in a non-executing type so we can transform it ourselves
+       with the CLASSIC JSX runtime (the automatic runtime injects an ES
+       `import` that can't run in a plain inline script). -->
+  <script type="text/bjt-jsx" id="app-src">
+// =============================================================================
+// Single-file port of the modular Blackjack Trainer.
+// Sections mirror the src/ files: DeckEngine, StrategyMatrix, useGame, components.
+// =============================================================================
+const { useState, useRef, useCallback, useMemo, useEffect } = React;
+const MISS_STORAGE_KEY = 'bjt_misses_v1';
+
+// ============================== DeckEngine ==================================
+const RANKS = ['A','2','3','4','5','6','7','8','9','10','J','Q','K'];
+const SUITS = ['♠','♥','♦','♣'];
+const PENETRATION = 0.75;
+
+function cardValue(rank) {
+  if (rank === 'A') return 11;
+  if (rank === 'J' || rank === 'Q' || rank === 'K') return 10;
+  return parseInt(rank, 10);
+}
+function hiLoValue(rank) {
+  const v = cardValue(rank);
+  if (v >= 2 && v <= 6) return +1;
+  if (v >= 10 || rank === 'A') return -1;
+  return 0;
+}
+function buildDeck(deckIndex) {
+  const cards = [];
+  for (const suit of SUITS)
+    for (const rank of RANKS)
+      cards.push({ rank, suit, value: cardValue(rank), hiLo: hiLoValue(rank),
+        red: suit === '♥' || suit === '♦', id: `${deckIndex}-${rank}${suit}` });
+  return cards;
+}
+function shuffle(cards) {
+  const a = cards.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+function createShoe(numDecks) {
+  let cards = [];
+  for (let d = 0; d < numDecks; d++) cards = cards.concat(buildDeck(d));
+  cards = shuffle(cards);
+  const total = cards.length;
+  return { cards, total, dealt: 0, cutCard: Math.floor(total * PENETRATION) };
+}
+function handValue(cards) {
+  let total = 0, aces = 0;
+  for (const c of cards) { total += c.value; if (c.rank === 'A') aces += 1; }
+  let softAces = aces;
+  while (total > 21 && softAces > 0) { total -= 10; softAces -= 1; }
+  const soft = softAces > 0;
+  const isPair = cards.length === 2 && cards[0].value === cards[1].value;
+  const isBlackjack = cards.length === 2 && total === 21;
+  return { total, soft, isBust: total > 21, isPair, isBlackjack };
+}
+function decksRemaining(shoe) { return (shoe.total - shoe.dealt) / 52; }
+function calcTrueCount(rc, shoe) {
+  const decks = Math.max(decksRemaining(shoe), 0.5);
+  return Math.round((rc / decks) * 10) / 10;
+}
+
+// ============================ StrategyMatrix ================================
+const DEALER_COLS = [2,3,4,5,6,7,8,9,10,11]; // 11 = Ace
+const row = (...codes) => { const o = {}; DEALER_COLS.forEach((c,i)=>o[c]=codes[i]); return o; };
+
+const HARD = {
+  5:  row('H','H','H','H','H','H','H','H','H','H'),
+  6:  row('H','H','H','H','H','H','H','H','H','H'),
+  7:  row('H','H','H','H','H','H','H','H','H','H'),
+  8:  row('H','H','H','H','H','H','H','H','H','H'),
+  9:  row('H','D','D','D','D','H','H','H','H','H'),
+  10: row('D','D','D','D','D','D','D','D','H','H'),
+  11: row('D','D','D','D','D','D','D','D','D','H'),
+  12: row('H','H','S','S','S','H','H','H','H','H'),
+  13: row('S','S','S','S','S','H','H','H','H','H'),
+  14: row('S','S','S','S','S','H','H','H','H','H'),
+  15: row('S','S','S','S','S','H','H','H','Rh','H'),
+  16: row('S','S','S','S','S','H','H','Rh','Rh','Rh'),
+  17: row('S','S','S','S','S','S','S','S','S','S'),
+  18: row('S','S','S','S','S','S','S','S','S','S'),
+  19: row('S','S','S','S','S','S','S','S','S','S'),
+  20: row('S','S','S','S','S','S','S','S','S','S'),
+  21: row('S','S','S','S','S','S','S','S','S','S'),
+};
+const SOFT = {
+  13: row('H','H','H','D','D','H','H','H','H','H'),
+  14: row('H','H','H','D','D','H','H','H','H','H'),
+  15: row('H','H','D','D','D','H','H','H','H','H'),
+  16: row('H','H','D','D','D','H','H','H','H','H'),
+  17: row('H','D','D','D','D','H','H','H','H','H'),
+  18: row('S','Ds','Ds','Ds','Ds','S','S','H','H','H'),
+  19: row('S','S','S','S','S','S','S','S','S','S'),
+  20: row('S','S','S','S','S','S','S','S','S','S'),
+  21: row('S','S','S','S','S','S','S','S','S','S'),
+};
+const PAIRS = {
+  2:  row('Ph','Ph','P','P','P','P','H','H','H','H'),
+  3:  row('Ph','Ph','P','P','P','P','H','H','H','H'),
+  4:  row('H','H','H','Ph','Ph','H','H','H','H','H'),
+  5:  row('D','D','D','D','D','D','D','D','H','H'),
+  6:  row('Ph','P','P','P','P','H','H','H','H','H'),
+  7:  row('P','P','P','P','P','P','H','H','H','H'),
+  8:  row('P','P','P','P','P','P','P','P','P','P'),
+  9:  row('P','P','P','P','P','S','P','P','S','S'),
+  10: row('S','S','S','S','S','S','S','S','S','S'),
+  11: row('P','P','P','P','P','P','P','P','P','P'),
+};
+const clone = (o) => JSON.parse(JSON.stringify(o));
+
+function buildStrategy(rules) {
+  const hard = clone(HARD), soft = clone(SOFT), pairs = clone(PAIRS);
+  if (rules.h17) {
+    hard[11][11] = 'D'; hard[15][11] = 'Rh'; hard[17][11] = 'S';
+    soft[18][2] = 'Ds'; soft[19][6] = 'Ds'; pairs[8][11] = 'Rp';
+  } else {
+    hard[11][11] = 'H'; hard[15][11] = 'H';
+  }
+  if (rules.noBust) {
+    for (let t = 12; t <= 16; t++) DEALER_COLS.forEach((c) => { hard[t][c] = 'S'; });
+  }
+  return { hard, soft, pairs, rules };
+}
+function canDouble(hand, rules) {
+  if (hand.cards.length !== 2) return false;
+  if (hand.fromSplit) { if (hand.splitAces) return false; return rules.das; }
+  return true;
+}
+function canSplit(hand) { return hand.cards.length === 2 && hand.cards[0].value === hand.cards[1].value; }
+function canSurrender(hand, rules) { return rules.surrender && hand.cards.length === 2 && !hand.fromSplit; }
+function resolveCode(code, hand, rules) {
+  switch (code) {
+    case 'H': return 'hit';
+    case 'S': return 'stand';
+    case 'D': return canDouble(hand, rules) ? 'double' : 'hit';
+    case 'Ds': return canDouble(hand, rules) ? 'double' : 'stand';
+    case 'P': return 'split';
+    case 'Ph': return rules.das ? 'split' : 'hit';
+    case 'Rh': return canSurrender(hand, rules) ? 'surrender' : 'hit';
+    case 'Rs': return canSurrender(hand, rules) ? 'surrender' : 'stand';
+    case 'Rp': return canSurrender(hand, rules) ? 'surrender' : 'split';
+    default: return 'stand';
+  }
+}
+const MOVE_VERB = { hit:'Hit', stand:'Stand', double:'Double Down', split:'Split', surrender:'Surrender' };
+const moveLabel = (m) => MOVE_VERB[m] || m;
+
+// --- chart helpers ---
+function resolveChartCell(code, rules) {
+  switch (code) {
+    case 'H': return { label: 'H', kind: 'hit' };
+    case 'S': return { label: 'S', kind: 'stand' };
+    case 'D': return { label: 'D', kind: 'double' };
+    case 'Ds': return { label: 'Ds', kind: 'double' };
+    case 'P': return { label: 'P', kind: 'split' };
+    case 'Ph': return rules.das ? { label: 'P', kind: 'split' } : { label: 'H', kind: 'hit' };
+    case 'Rh': return rules.surrender ? { label: 'SUR', kind: 'surrender' } : { label: 'H', kind: 'hit' };
+    case 'Rs': return rules.surrender ? { label: 'SUR', kind: 'surrender' } : { label: 'S', kind: 'stand' };
+    case 'Rp': return rules.surrender ? { label: 'SUR', kind: 'surrender' } : { label: 'P', kind: 'split' };
+    default: return { label: code, kind: 'stand' };
+  }
+}
+const CHART_ROWS = {
+  hard: [8,9,10,11,12,13,14,15,16,17],
+  soft: [13,14,15,16,17,18,19,20],
+  pairs: [2,3,4,5,6,7,8,9,10,11],
+};
+function chartRowLabel(section, key) {
+  if (section === 'hard') return String(key);
+  if (section === 'soft') return `A,${key - 11}`;
+  return key === 11 ? 'A,A' : `${key},${key}`;
+}
+function chartColLabel(col) { return col === 11 ? 'A' : String(col); }
+
+function buildExplanation({ move, code, category, playerLabel, dealerLabel, total, rules }) {
+  const head = `With ${playerLabel} against a dealer ${dealerLabel}, the book play is to ${MOVE_VERB[move]}.`;
+  const dealerWeak = dealerLabel !== 'Ace' && Number(dealerLabel) >= 2 && Number(dealerLabel) <= 6;
+  if (rules.noBust && category === 'hard' && total >= 12 && total <= 16 && move === 'stand') {
+    return `${head} Under the "no-bust" variation you never take a card that could bust a hard 12–16. This is intentionally conservative and gives up some EV versus classic basic strategy — it lets the dealer do the busting for you.`;
+  }
+  let why = '';
+  switch (move) {
+    case 'double':
+      why = dealerWeak
+        ? `The dealer is weak (likely to bust on ${dealerLabel}), and your hand is strong enough to want more money out when you'll most often improve to a winner.`
+        : `Your starting total has a strong expectation here, so getting extra money out on a single card is worth more than the risk of a bad draw.`;
+      break;
+    case 'split':
+      why = playerLabel.includes('Aces')
+        ? 'Splitting Aces turns one mediocre hand into two hands each starting with 11 — far too valuable to pass up (you only get one card on each).'
+        : playerLabel.includes('8s')
+        ? '16 is the worst hand in blackjack; splitting 8s breaks it into two fresh hands each starting at 8, which is strictly better.'
+        : `Splitting here gives you two hands with a better expectation than the single combined total, especially against the dealer's ${dealerLabel}.`;
+      break;
+    case 'surrender':
+      why = `You're a statistical underdog with ${playerLabel} versus a ${dealerLabel}. Late surrender forfeits half the bet, which loses less in the long run than playing the hand out.`;
+      break;
+    case 'stand':
+      why = dealerWeak
+        ? `The dealer is likely to bust showing a ${dealerLabel}, so don't risk busting yourself — let them take the cards.`
+        : `Hitting risks busting more often than it improves the hand here, so standing is the lower-loss play.`;
+      break;
+    default:
+      why = dealerWeak
+        ? `Even though the dealer is weak, your total is low enough that standing would just hand them the pot — take a card.`
+        : `The dealer's ${dealerLabel} is strong, so you must improve your total rather than stand on a likely loser.`;
+  }
+  return `${head} ${why}`;
+}
+
+function getOptimalMove(hand, dealerUpcard, strategy) {
+  const { rules } = strategy;
+  const { total, soft, isPair } = handValue(hand.cards);
+  const dCol = dealerUpcard.rank === 'A' ? 11 : Math.min(dealerUpcard.value, 10);
+  const dealerLabel = dealerUpcard.rank === 'A' ? 'Ace' : String(Math.min(dealerUpcard.value, 10));
+  let code, category, playerLabel;
+  if (isPair && canSplit(hand)) {
+    const pv = hand.cards[0].value;
+    code = strategy.pairs[pv][dCol]; category = 'pair';
+    playerLabel = `a pair of ${pv === 11 ? 'Aces' : pv + 's'}`;
+  } else if (soft && total <= 21) {
+    code = (strategy.soft[total] || strategy.hard[Math.min(total, 21)])[dCol];
+    category = 'soft'; playerLabel = `soft ${total}`;
+  } else {
+    const t = Math.max(5, Math.min(total, 21));
+    code = strategy.hard[t][dCol]; category = 'hard'; playerLabel = `hard ${total}`;
+  }
+  const move = resolveCode(code, hand, rules);
+  const explanation = buildExplanation({ move, code, category, playerLabel, dealerLabel, total, rules });
+  return { move, code, category, playerLabel, dealerLabel, explanation };
+}
+
+// =============================== useGame ====================================
+const PHASE = { BETTING:'betting', PLAYER:'player', DEALER:'dealer', SETTLE:'settle' };
+// Defaults: common large-Oklahoma-casino (WinStar) main tables.
+const DEFAULT_RULES = { h17:true, das:true, surrender:false, decks:8, noBust:false, showBankroll:true };
+const STARTING_BANKROLL = 1000;
+const MIN_BET = 5;
+let HAND_SEQ = 0;
+const newHand = (cards, bet, extra={}) => ({
+  id: ++HAND_SEQ, cards, bet, fromSplit:false, splitAces:false, doubled:false,
+  surrendered:false, done:false, result:null, ...extra,
+});
+let SYNTH_SEQ = 0;
+function makeCard(rank) {
+  const suit = SUITS[Math.floor(Math.random() * SUITS.length)];
+  return { rank, suit, value: cardValue(rank), hiLo: hiLoValue(rank),
+    red: suit === '♥' || suit === '♦', id: `synth-${++SYNTH_SEQ}-${rank}${suit}` };
+}
+const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
+// Minimum number of total mistakes before Review/Practice unlocks.
+const MIN_REVIEW_MISSES = 10;
+// Pick a scenario from a pool, weighted by how often it was missed.
+function pickWeighted(scenarios) {
+  const total = scenarios.reduce((s, x) => s + (x.weight || 1), 0);
+  let r = Math.random() * total;
+  for (const sc of scenarios) { r -= (sc.weight || 1); if (r <= 0) return sc; }
+  return scenarios[scenarios.length - 1];
+}
+
+function useGame() {
+  const [rules, setRules] = useState(DEFAULT_RULES);
+  const [mode, setMode] = useState('learn');
+  const shoeRef = useRef(createShoe(DEFAULT_RULES.decks));
+  const countRef = useRef(0);
+  const [shoe, setShoeState] = useState(shoeRef.current);
+  const [runningCount, setRunningCountState] = useState(0);
+  const [phase, setPhase] = useState(PHASE.BETTING);
+  const [playerHands, setPlayerHands] = useState([]);
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [dealer, setDealer] = useState({ cards: [], hideHole: true });
+  const [bankroll, setBankroll] = useState(STARTING_BANKROLL);
+  const [bet, setBet] = useState(25);
+  const [stats, setStats] = useState({ correct: 0, total: 0 });
+  const [feedback, setFeedback] = useState(null);
+  const [message, setMessage] = useState('Set your bet and deal.');
+  const [misses, setMisses] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(MISS_STORAGE_KEY) || '{}'); }
+    catch (e) { return {}; }
+  });
+  // Persist the mistake log so Review/Practice survive reloads.
+  useEffect(() => {
+    try { localStorage.setItem(MISS_STORAGE_KEY, JSON.stringify(misses)); }
+    catch (e) { /* storage unavailable — keep in-memory only */ }
+  }, [misses]);
+  const [practice, setPractice] = useState(null);   // { scenarios:[...], label }
+  const [currentDrill, setCurrentDrill] = useState(null); // scenario chosen for the current hand
+
+  const strategy = useMemo(() => buildStrategy(rules), [rules]);
+  const trueCount = useMemo(() => calcTrueCount(runningCount, shoe), [runningCount, shoe]);
+  const decksLeft = useMemo(() => Math.round(decksRemaining(shoe) * 10) / 10, [shoe]);
+  const accuracy = stats.total === 0 ? null : Math.round((stats.correct / stats.total) * 100);
+
+  const addToCount = useCallback((cards) => {
+    countRef.current += cards.reduce((s,c)=>s+c.hiLo,0);
+    setRunningCountState(countRef.current);
+  }, []);
+  const drawCards = useCallback((n, { count = true } = {}) => {
+    const s = shoeRef.current;
+    const cards = s.cards.slice(s.dealt, s.dealt + n);
+    shoeRef.current = { ...s, dealt: s.dealt + n };
+    setShoeState(shoeRef.current);
+    if (count) addToCount(cards);
+    return cards;
+  }, [addToCount]);
+  const reshuffle = useCallback((decks) => {
+    shoeRef.current = createShoe(decks); countRef.current = 0;
+    setShoeState(shoeRef.current); setRunningCountState(0);
+  }, []);
+
+  const updateRule = useCallback((key, value) => {
+    setRules((r) => ({ ...r, [key]: value }));
+    if (key === 'decks') {
+      reshuffle(value); setPhase(PHASE.BETTING); setPlayerHands([]);
+      setDealer({ cards: [], hideHole: true }); setFeedback(null);
+      setMessage('New shoe loaded. Set your bet and deal.');
+    }
+  }, [reshuffle]);
+
+  const settlePayouts = useCallback((hands, dealerCardsArg, showMoney) => {
+    setDealer((d) => {
+      const dealerCards = dealerCardsArg || d.cards;
+      const dv = handValue(dealerCards);
+      const notes = [];
+      const settled = hands.map((h) => {
+        if (h.result === 'surrender') {
+          setBankroll((b)=>b + h.bet/2); notes.push('surrender'); return h;
+        }
+        const pv = handValue(h.cards);
+        let result, payout = 0;
+        if (pv.isBust) result = 'lose';
+        else if (dv.isBust || pv.total > dv.total) { result='win'; payout=h.bet*2; }
+        else if (pv.total < dv.total) result = 'lose';
+        else { result='push'; payout=h.bet; }
+        if (payout) setBankroll((b)=>b+payout);
+        notes.push(showMoney
+          ? (result==='win'?`win $${h.bet}`:result==='push'?'push':`lose $${h.bet}`)
+          : result);
+        return { ...h, result };
+      });
+      setPlayerHands(settled);
+      setPhase(PHASE.SETTLE);
+      setMessage(`Dealer ${dv.isBust ? 'busts' : dv.total}. ${notes.join(' · ')}.`);
+      return { cards: dealerCards, hideHole: false };
+    });
+  }, []);
+
+  const revealHoleOnly = useCallback(() => {
+    setDealer((d) => { addToCount([d.cards[1]]); return { ...d, hideHole: false }; });
+  }, [addToCount]);
+
+  const runDealer = useCallback((hands) => {
+    setDealer((d) => {
+      const dealerCards = [...d.cards];
+      addToCount([dealerCards[1]]);
+      while (true) {
+        const hv = handValue(dealerCards);
+        if (hv.total > 17) break;
+        if (hv.total === 17 && !(hv.soft && rules.h17)) break;
+        dealerCards.push(drawCards(1)[0]);
+      }
+      setTimeout(() => settlePayouts(hands, dealerCards, rules.showBankroll), 50);
+      return { cards: dealerCards, hideHole: false };
+    });
+  }, [addToCount, drawCards, rules.h17, rules.showBankroll, settlePayouts]);
+
+  const applyAction = useCallback((action) => {
+    setPlayerHands((prev) => {
+      const hands = prev.map((h) => ({ ...h, cards: [...h.cards] }));
+      const hand = hands[activeIndex];
+      if (!hand || hand.done) return prev;
+      if (action === 'hit') {
+        hand.cards.push(drawCards(1)[0]);
+        const hv = handValue(hand.cards);
+        if (hv.isBust) { hand.done = true; hand.result = 'bust'; }
+        else if (hv.total === 21) hand.done = true;
+      } else if (action === 'stand') {
+        hand.done = true;
+      } else if (action === 'double') {
+        setBankroll((b)=>b - hand.bet); hand.bet *= 2; hand.doubled = true;
+        hand.cards.push(drawCards(1)[0]); hand.done = true;
+        if (handValue(hand.cards).isBust) hand.result = 'bust';
+      } else if (action === 'surrender') {
+        hand.surrendered = true; hand.done = true; hand.result = 'surrender';
+      } else if (action === 'split') {
+        setBankroll((b)=>b - hand.bet);
+        const isAces = hand.cards[0].rank === 'A';
+        const handA = newHand([hand.cards[0], drawCards(1)[0]], hand.bet, { fromSplit:true, splitAces:isAces });
+        const handB = newHand([hand.cards[1], drawCards(1)[0]], hand.bet, { fromSplit:true, splitAces:isAces });
+        if (isAces) { handA.done = true; handB.done = true; }
+        hands.splice(activeIndex, 1, handA, handB);
+      }
+      const firstUnfinished = hands.findIndex((h) => !h.done);
+      if (firstUnfinished === -1) {
+        const anyLive = hands.some((h) => h.result !== 'bust' && h.result !== 'surrender');
+        setActiveIndex(0);
+        if (anyLive) { setPhase(PHASE.DEALER); setTimeout(() => runDealer(hands), 350); }
+        else { revealHoleOnly(); setTimeout(() => settlePayouts(hands, null, rules.showBankroll), 50); }
+      } else {
+        setActiveIndex(firstUnfinished);
+      }
+      return hands;
+    });
+  }, [activeIndex, drawCards, runDealer, revealHoleOnly, settlePayouts, rules.showBankroll]);
+
+  const recordMiss = useCallback((action, hand, optimal) => {
+    const catg = optimal.category;
+    const playerKey = catg === 'pair' ? hand.cards[0].value : handValue(hand.cards).total;
+    const key = `${catg}|${playerKey}|${optimal.dealerLabel}`;
+    setMisses((m) => {
+      const prev = m[key] || {
+        key, count: 0, category: catg, playerLabel: optimal.playerLabel,
+        dealerLabel: optimal.dealerLabel, correctMove: optimal.move, explanation: optimal.explanation,
+        scenario: { category: catg, playerRanks: hand.cards.slice(0,2).map((c)=>c.rank), dealerRank: dealer.cards[0].rank },
+        chosen: {},
+      };
+      return { ...m, [key]: { ...prev, count: prev.count + 1, correctMove: optimal.move,
+        explanation: optimal.explanation, chosen: { ...prev.chosen, [action]: (prev.chosen[action]||0)+1 } } };
+    });
+  }, [dealer.cards]);
+
+  const gradeDecision = useCallback((action, hand) => {
+    if (mode !== 'quiz') return true;
+    const optimal = getOptimalMove(hand, dealer.cards[0], strategy);
+    const correct = action === optimal.move;
+    setStats((s) => ({ correct: s.correct + (correct ? 1 : 0), total: s.total + 1 }));
+    if (correct) { setFeedback({ correct: true, text: `Correct — ${moveLabel(optimal.move)} is the book play.` }); return true; }
+    recordMiss(action, hand, optimal);
+    setFeedback({ correct:false, text:optimal.explanation, chose:action, optimal:optimal.move, pending:action });
+    return false;
+  }, [mode, dealer.cards, strategy, recordMiss]);
+
+  const requestAction = useCallback((action) => {
+    if (phase !== PHASE.PLAYER) return;
+    const hand = playerHands[activeIndex];
+    if (!hand || hand.done) return;
+    if (gradeDecision(action, hand)) applyAction(action);
+  }, [phase, playerHands, activeIndex, gradeDecision, applyAction]);
+
+  const acknowledgeFeedback = useCallback(() => {
+    const pending = feedback && feedback.pending;
+    setFeedback(null);
+    if (pending) applyAction(pending);
+  }, [feedback, applyAction]);
+
+  const deal = useCallback(() => {
+    if (phase !== PHASE.BETTING) return;
+    const wager = Math.max(MIN_BET, Math.min(bet, bankroll));
+    if (rules.showBankroll && bankroll < MIN_BET) { setMessage('Bankroll too low — reset to continue.'); return; }
+    if (shoeRef.current.dealt >= shoeRef.current.cutCard) {
+      reshuffle(rules.decks); setMessage('Cut card reached — shuffled a fresh shoe.');
+    }
+    setFeedback(null);
+    if (rules.showBankroll) setBankroll((b)=>b - wager);
+
+    let pCards, dCards;
+    if (practice) {
+      // Rotate: each rep randomly picks one of your missed situations.
+      const sc = pickWeighted(practice.scenarios);
+      setCurrentDrill(sc);
+      const p = sc.playerRanks.map(makeCard);
+      addToCount(p);
+      const du = makeCard(sc.dealerRank);
+      addToCount([du]);
+      const hole = drawCards(1, { count:false })[0];
+      pCards = p; dCards = [du, hole];
+    } else {
+      const p1 = drawCards(1)[0], d1 = drawCards(1)[0], p2 = drawCards(1)[0], d2 = drawCards(1, {count:false})[0];
+      pCards = [p1, p2]; dCards = [d1, d2];
+    }
+
+    const hand = newHand(pCards, wager);
+    const playerBJ = handValue(pCards).isBlackjack;
+    const dealerBJ = handValue(dCards).isBlackjack;
+    if (playerBJ || dealerBJ) {
+      addToCount([dCards[1]]); setDealer({ cards: dCards, hideHole: false });
+      let result, payout, msg;
+      if (playerBJ && dealerBJ) { result='push'; payout=wager; msg='Both have blackjack — push.'; }
+      else if (playerBJ) { result='blackjack'; payout=wager+wager*1.5; msg='Blackjack! Paid 3:2.'; }
+      else { result='lose'; payout=0; msg='Dealer has blackjack. You lose.'; }
+      if (rules.showBankroll) setBankroll((b)=>b+payout);
+      setPlayerHands([{ ...hand, done:true, result }]);
+      setPhase(PHASE.SETTLE); setMessage(msg); return;
+    }
+    setPlayerHands([hand]); setActiveIndex(0);
+    setDealer({ cards: dCards, hideHole: true }); setPhase(PHASE.PLAYER);
+    setMessage(practice
+      ? 'Practice rep — read the hand and choose your play.'
+      : mode === 'learn' ? 'Learning mode: the recommended play is shown below.' : 'Quiz mode: choose your play.');
+  }, [phase, bet, bankroll, rules.decks, rules.showBankroll, reshuffle, drawCards, addToCount, mode, practice]);
+
+  const nextRound = useCallback(() => {
+    setPlayerHands([]); setDealer({ cards: [], hideHole: true });
+    setFeedback(null); setActiveIndex(0); setPhase(PHASE.BETTING);
+    if (rules.showBankroll && bankroll < MIN_BET) setMessage('Bankroll depleted — reset to keep practicing.');
+    else setMessage(shoeRef.current.dealt >= shoeRef.current.cutCard
+      ? 'Cut card reached — next deal reshuffles. Set your bet.'
+      : practice ? 'Deal the next practice rep.' : 'Set your bet and deal.');
+  }, [bankroll, rules.showBankroll, practice]);
+
+  const resetBankroll = useCallback(() => {
+    setBankroll(STARTING_BANKROLL); setStats({ correct: 0, total: 0 });
+    setMessage('Bankroll and stats reset.');
+  }, []);
+
+  const missList = useMemo(() => Object.values(misses).sort((a,b)=>b.count-a.count), [misses]);
+
+  // Start a practice session over a list of missed situations. Each deal
+  // randomly rotates through them (weighted by how often each was missed),
+  // so you drill across your mistakes instead of repeating one hand.
+  const startPractice = useCallback((missesArr) => {
+    const scenarios = missesArr.map((m) => ({
+      playerRanks: m.scenario.playerRanks,
+      dealerRank: m.scenario.dealerRank,
+      correctMove: m.correctMove,
+      label: `${cap(m.playerLabel)} vs ${m.dealerLabel}`,
+      weight: m.count,
+    }));
+    if (scenarios.length === 0) return;
+    setPractice({
+      scenarios,
+      label: scenarios.length === 1 ? scenarios[0].label : `${scenarios.length} of your missed situations`,
+    });
+    setCurrentDrill(null);
+    setMode('quiz'); setPlayerHands([]); setDealer({ cards: [], hideHole: true });
+    setFeedback(null); setPhase(PHASE.BETTING); setMessage('Practice loaded — Deal to begin.');
+  }, []);
+  const exitPractice = useCallback(() => {
+    setPractice(null); setCurrentDrill(null); setMessage('Practice ended. Set your bet and deal.');
+  }, []);
+  const clearMisses = useCallback(() => setMisses({}), []);
+
+  const liveHint = useMemo(() => {
+    if (phase !== PHASE.PLAYER) return null;
+    const hand = playerHands[activeIndex];
+    if (!hand || hand.done || dealer.cards.length === 0) return null;
+    return getOptimalMove(hand, dealer.cards[0], strategy);
+  }, [phase, playerHands, activeIndex, dealer.cards, strategy]);
+
+  const legalActions = useMemo(() => {
+    const hand = playerHands[activeIndex];
+    if (phase !== PHASE.PLAYER || !hand || hand.done)
+      return { hit:false, stand:false, double:false, split:false, surrender:false };
+    const twoCards = hand.cards.length === 2;
+    const isPair = twoCards && hand.cards[0].value === hand.cards[1].value;
+    const canAffordExtra = !rules.showBankroll || bankroll >= hand.bet;
+    return {
+      hit: !hand.splitAces,
+      stand: true,
+      double: twoCards && canAffordExtra && (!hand.fromSplit || rules.das) && !hand.splitAces,
+      split: isPair && canAffordExtra && !hand.splitAces,
+      surrender: rules.surrender && twoCards && !hand.fromSplit,
+    };
+  }, [phase, playerHands, activeIndex, bankroll, rules.das, rules.surrender, rules.showBankroll]);
+
+  return {
+    rules, mode, phase, playerHands, activeIndex, dealer, bankroll, bet, stats,
+    accuracy, feedback, message, runningCount, trueCount, decksLeft, shoe,
+    strategy, liveHint, legalActions, misses, missList, practice, currentDrill,
+    setMode, setBet, updateRule, deal, requestAction, acknowledgeFeedback,
+    nextRound, resetBankroll, startPractice, exitPractice, clearMisses,
+    PHASE, MIN_BET, MIN_REVIEW_MISSES,
+  };
+}
+
+// ============================== Components ==================================
+function Card({ card, faceDown }) {
+  if (faceDown || !card) {
+    return (
+      <div className="w-14 h-20 sm:w-16 sm:h-24 rounded-lg border border-blue-900 bg-gradient-to-br from-blue-700 to-blue-900 shadow-md flex items-center justify-center animate-deal">
+        <div className="w-8 h-14 rounded border-2 border-blue-300/40" />
+      </div>
+    );
+  }
+  const color = card.red ? 'text-red-600' : 'text-gray-900';
+  return (
+    <div className="w-14 h-20 sm:w-16 sm:h-24 rounded-lg border border-gray-300 bg-white shadow-md relative animate-deal select-none">
+      <div className={`absolute top-1 left-1.5 leading-none font-bold ${color}`}>
+        <div className="text-sm sm:text-base">{card.rank}</div>
+        <div className="text-xs sm:text-sm">{card.suit}</div>
+      </div>
+      <div className={`absolute inset-0 flex items-center justify-center text-2xl sm:text-3xl ${color}`}>{card.suit}</div>
+      <div className={`absolute bottom-1 right-1.5 leading-none font-bold rotate-180 ${color}`}>
+        <div className="text-sm sm:text-base">{card.rank}</div>
+        <div className="text-xs sm:text-sm">{card.suit}</div>
+      </div>
+    </div>
+  );
+}
+
+function Hand({ label, cards, hideHole, active, result, bet, doubled, tip }) {
+  const visible = hideHole ? cards.slice(0,1) : cards;
+  const hv = hideHole ? null : handValue(cards);
+  const resultColor = (result==='win'||result==='blackjack') ? 'text-green-300'
+    : (result==='lose'||result==='bust') ? 'text-red-300'
+    : result==='push' ? 'text-yellow-200' : 'text-white';
+  return (
+    <div className={`rounded-xl p-3 transition ${active ? 'ring-2 ring-yellow-300 bg-black/20' : 'bg-black/10'}`}>
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-xs uppercase tracking-wider text-white/70 flex items-center">{label}{tip && <InfoTip text={tip} align="left" />}</span>
+        <div className="flex items-center gap-2">
+          {bet != null && <span className="text-xs text-amber-200">${bet}{doubled ? ' (2x)' : ''}</span>}
+          {hv && (
+            <span className={`text-sm font-bold ${resultColor}`}>
+              {hv.isBust ? `${hv.total} BUST` : hv.soft ? `${hv.total} soft` : hv.total}{hv.isBlackjack ? ' BJ' : ''}
+            </span>
+          )}
+        </div>
+      </div>
+      <div className="flex gap-2 flex-wrap">
+        {cards.map((c,i) => <Card key={c.id} card={c} faceDown={hideHole && i===1} />)}
+        {visible.length === 0 && <div className="h-20 sm:h-24" />}
+      </div>
+      {result && <div className={`mt-2 text-xs font-semibold uppercase tracking-wide ${resultColor}`}>{result}</div>}
+    </div>
+  );
+}
+
+// Reusable hover help: a small "i" badge that reveals an explanatory box.
+function InfoTip({ text, align = 'center' }) {
+  const pos = align === 'left' ? 'left-0' : align === 'right' ? 'right-0' : 'left-1/2 -translate-x-1/2';
+  return (
+    <span className="relative inline-flex group align-middle ml-1">
+      <span className="w-3.5 h-3.5 rounded-full bg-white/20 hover:bg-white/30 text-white/90 text-[9px] leading-none flex items-center justify-center cursor-help font-bold">i</span>
+      <span className={`pointer-events-none absolute z-[60] ${pos} bottom-full mb-1.5 w-48 rounded-lg bg-black/95 border border-white/15 p-2 text-[11px] leading-snug text-white/90 opacity-0 group-hover:opacity-100 transition normal-case tracking-normal font-normal shadow-xl`}>
+        {text}
+      </span>
+    </span>
+  );
+}
+
+// Header used by collapsible sidebar panels.
+function PanelHeader({ title, tip, collapsed, onToggle, right }) {
+  return (
+    <div className="flex items-center justify-between mb-2">
+      <span className="text-[10px] uppercase tracking-wider text-white/60 flex items-center">
+        {title}{tip && <InfoTip text={tip} align="left" />}
+      </span>
+      <div className="flex items-center gap-2">
+        {right}
+        <button onClick={onToggle} className="text-white/60 hover:text-white text-xs px-1" aria-label="Collapse">
+          {collapsed ? '▸' : '▾'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function CountStat({ label, value, highlight, tip }) {
+  return (
+    <div>
+      <div className={`text-xl font-bold ${highlight ? 'text-yellow-300' : 'text-white'}`}>{value}</div>
+      <div className="text-[10px] uppercase tracking-wider text-white/60 flex items-center justify-center">
+        {label}{tip && <InfoTip text={tip} />}
+      </div>
+    </div>
+  );
+}
+function CountDisplay({ runningCount, trueCount, decksLeft, shoe }) {
+  const [showInfo, setShowInfo] = useState(false);
+  const [collapsed, setCollapsed] = useState(false);
+  const pct = Math.min(100, Math.round((shoe.dealt / shoe.total) * 100));
+  const cutPct = Math.round((shoe.cutCard / shoe.total) * 100);
+  const sign = (n) => (n > 0 ? `+${n}` : `${n}`);
+  return (
+    <div className="bg-black/25 rounded-xl p-3 text-white">
+      <PanelHeader
+        title="Hi-Lo Count"
+        tip="Card counting tracker. Counting tells you when the remaining shoe is rich in high cards, which favours the player."
+        collapsed={collapsed}
+        onToggle={() => setCollapsed((v) => !v)}
+        right={!collapsed && (
+          <button onClick={() => setShowInfo((v) => !v)} className="text-[11px] text-sky-300 hover:text-sky-200">
+            {showInfo ? 'hide' : 'ⓘ how it works'}
+          </button>
+        )}
+      />
+
+      {collapsed ? (
+        <div className="text-sm text-white/80">
+          Running <b className="text-white">{sign(runningCount)}</b> · True{' '}
+          <b className="text-yellow-300">{sign(trueCount)}</b>
+        </div>
+      ) : (
+        <>
+          <div className="grid grid-cols-3 gap-2 text-center mb-3">
+            <CountStat label="Running" value={sign(runningCount)} tip="The sum of Hi-Lo tags for every card seen this shoe. Goes up as small cards leave, down as big cards leave." />
+            <CountStat label="True Count" value={sign(trueCount)} highlight tip="Running count ÷ decks remaining. This is the number you bet by — positive means the edge has shifted toward you." />
+            <CountStat label="Decks Left" value={decksLeft.toFixed(1)} tip="Estimated decks still in the shoe. Used to convert the running count into the true count." />
+          </div>
+
+          {showInfo && (
+            <div className="mb-3 text-[11px] leading-relaxed text-white/75 bg-black/30 rounded-lg p-2.5 space-y-1.5">
+              <div>Each card seen changes the <b>running count</b> by its Hi-Lo tag:</div>
+              <div className="flex gap-1.5">
+                <span className="flex-1 text-center rounded bg-emerald-600/40 py-1"><b>2–6</b><br/>+1</span>
+                <span className="flex-1 text-center rounded bg-white/10 py-1"><b>7–9</b><br/>0</span>
+                <span className="flex-1 text-center rounded bg-rose-600/40 py-1"><b>10–A</b><br/>−1</span>
+              </div>
+              <div><b>True count</b> = running ÷ decks remaining — it normalises the
+              running count for shoe size, since one extra high card matters more with
+              fewer decks left.</div>
+              <div>A higher true count means more tens/aces remain (more blackjacks,
+              more dealer busts) — that's when you raise your bet.</div>
+            </div>
+          )}
+
+          <div className="text-[10px] uppercase tracking-wider text-white/60 mb-1 flex justify-between items-center">
+            <span className="flex items-center">Penetration<InfoTip text="How deep into the shoe you are. At the 75% cut card (red mark) the shoe is reshuffled and the count resets." align="left" /></span>
+            <span>{pct}% dealt</span>
+          </div>
+          <div className="relative h-2 rounded bg-white/10 overflow-hidden">
+            <div className="h-full bg-emerald-400" style={{ width: `${pct}%` }} />
+            <div className="absolute top-0 h-full w-0.5 bg-red-400" style={{ left: `${cutPct}%` }} title="Cut card (reshuffle)" />
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function Modal({ open, title, onClose, children, maxWidth = 'max-w-lg' }) {
+  if (!open) return null;
+  // Panel is capped to the viewport; the HEADER stays fixed and only the BODY
+  // scrolls, so tall content (the strategy chart) can never clip at the top.
+  return (
+    <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-3" onClick={onClose}>
+      <div
+        className={`bg-emerald-950 text-white rounded-2xl w-full ${maxWidth} max-h-[90vh] flex flex-col shadow-2xl border border-emerald-400/20 animate-deal`}
+        onClick={(e)=>e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-4 py-3 border-b border-white/10 shrink-0">
+          <h2 className="font-bold text-lg">{title}</h2>
+          <button onClick={onClose} className="w-8 h-8 rounded-lg bg-white/10 hover:bg-white/20 text-white/80 text-lg leading-none" aria-label="Close">✕</button>
+        </div>
+        <div className="p-4 overflow-y-auto">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function SettingsLabel({ children }) {
+  return <div className="text-[11px] uppercase tracking-wider text-white/60 mb-1.5">{children}</div>;
+}
+function Segment({ active, onClick, children }) {
+  return (
+    <button onClick={onClick} className={`py-1.5 rounded-lg text-sm font-semibold transition ${active ? 'bg-yellow-300 text-emerald-950' : 'bg-white/10 text-white/80 hover:bg-white/20'}`}>{children}</button>
+  );
+}
+function Toggle({ checked, onChange, label }) {
+  return (
+    <button onClick={() => onChange(!checked)} className="w-full flex items-center justify-between bg-white/5 hover:bg-white/10 rounded-lg px-3 py-1.5 transition">
+      <span className="text-sm text-white/85 text-left">{label}</span>
+      <span className={`w-9 h-5 rounded-full p-0.5 transition ${checked ? 'bg-yellow-300' : 'bg-white/20'}`}>
+        <span className={`block w-4 h-4 rounded-full bg-white transition-transform ${checked ? 'translate-x-4' : ''}`} />
+      </span>
+    </button>
+  );
+}
+function SettingsPanel({ rules, updateRule }) {
+  return (
+    <div className="text-white space-y-4">
+      <div>
+        <SettingsLabel>Dealer · Soft 17</SettingsLabel>
+        <div className="grid grid-cols-2 gap-2">
+          <Segment active={rules.h17} onClick={()=>updateRule('h17', true)}>H17 (hits)</Segment>
+          <Segment active={!rules.h17} onClick={()=>updateRule('h17', false)}>S17 (stands)</Segment>
+        </div>
+      </div>
+      <div>
+        <SettingsLabel>Shoe Size</SettingsLabel>
+        <div className="grid grid-cols-4 gap-2">
+          {[1,2,6,8].map((d)=>(<Segment key={d} active={rules.decks===d} onClick={()=>updateRule('decks', d)}>{d}</Segment>))}
+        </div>
+        <p className="text-[11px] text-white/50 mt-1">Changing shoe size shuffles a fresh shoe and resets the count.</p>
+      </div>
+      <div>
+        <SettingsLabel>Player Options</SettingsLabel>
+        <div className="space-y-2">
+          <Toggle checked={rules.das} onChange={(v)=>updateRule('das', v)} label="Double After Split (DAS)" />
+          <Toggle checked={rules.surrender} onChange={(v)=>updateRule('surrender', v)} label="Late Surrender" />
+          <Toggle checked={rules.noBust} onChange={(v)=>updateRule('noBust', v)} label='"No-bust" strategy variation' />
+        </div>
+      </div>
+      <div>
+        <SettingsLabel>Display</SettingsLabel>
+        <Toggle checked={rules.showBankroll} onChange={(v)=>updateRule('showBankroll', v)} label="Show betting & bankroll" />
+        <p className="text-[11px] text-white/50 mt-1">Turn off to hide the bankroll/bet panel and just drill strategy.</p>
+      </div>
+      <p className="text-[11px] text-amber-200/80">Defaults match common large-Oklahoma-casino main tables (8 decks, H17, DAS, no surrender, 3:2).</p>
+    </div>
+  );
+}
+
+const CHIPS = [5, 25, 100, 500];
+function BankrollBar({ bankroll, bet, setBet, phase, PHASE, minBet, trueCount, accuracy, stats, onReset }) {
+  const [collapsed, setCollapsed] = useState(false);
+  const canBet = phase === PHASE.BETTING;
+  const clamp = (v) => Math.max(minBet, Math.min(v, bankroll));
+  return (
+    <div className="bg-black/25 rounded-xl p-3 text-white">
+      <PanelHeader
+        title="Bankroll & Betting"
+        tip="Practice money only. Adjust your bet between hands so you can rehearse betting more when the true count is high and the minimum when it isn't."
+        collapsed={collapsed}
+        onToggle={() => setCollapsed((v) => !v)}
+      />
+
+      <div className="flex items-center justify-between mb-2">
+        <div>
+          <div className="text-[10px] uppercase tracking-wider text-white/60 flex items-center">
+            Bankroll<InfoTip text="Your virtual balance. Each bet is deducted on the deal and winnings are paid on settle (blackjack pays 3:2)." align="left" />
+          </div>
+          <div className="text-2xl font-bold text-emerald-300">${bankroll.toFixed(0)}</div>
+        </div>
+        <div className="text-right">
+          <div className="text-[10px] uppercase tracking-wider text-white/60 flex items-center justify-end">
+            Accuracy<InfoTip text="Share of your Quiz-mode decisions that matched basic strategy. Learning-mode hands aren't graded." />
+          </div>
+          <div className="text-2xl font-bold text-yellow-300">{accuracy == null ? '—' : `${accuracy}%`}</div>
+          <div className="text-[10px] text-white/50">{stats.total} graded</div>
+        </div>
+      </div>
+
+      {!collapsed && (
+        <>
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-[11px] uppercase tracking-wider text-white/60 flex items-center">
+              Bet<InfoTip text="Tap the chips to size your wager (between hands only). A rough counting guide: bet ≈ (true count − 1) × your minimum." align="left" />
+            </span>
+            <span className="text-lg font-bold text-amber-200">${bet}</span>
+          </div>
+          <div className="grid grid-cols-4 gap-2 mb-2">
+            {CHIPS.map((c)=>(
+              <button key={c} disabled={!canBet} onClick={()=>setBet((b)=>clamp(b+c))} className="py-1.5 rounded-lg bg-white/10 hover:bg-white/20 disabled:opacity-40 text-sm font-semibold">+{c}</button>
+            ))}
+          </div>
+          <div className="flex gap-2">
+            <button disabled={!canBet} onClick={()=>setBet(minBet)} className="flex-1 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 disabled:opacity-40 text-xs">Clear</button>
+            <button onClick={onReset} className="flex-1 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-xs">Reset Bankroll</button>
+          </div>
+          {canBet && (
+            <p className="text-[11px] text-white/55 mt-2">
+              True count is <b className="text-yellow-200">{trueCount > 0 ? `+${trueCount}` : trueCount}</b>.
+              {trueCount >= 2 ? ' Counts favor the player — a bigger bet has positive expectation.' : ' Neutral or negative count — keep the bet at the minimum.'}
+            </p>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function Controls({ phase, PHASE, legalActions, requestAction, deal, nextRound, mode, liveHint, bankroll, minBet, showMoney }) {
+  const broke = showMoney && bankroll < minBet;
+  if (phase === PHASE.BETTING) {
+    return (
+      <div>
+        <button onClick={deal} disabled={broke} className="w-full py-3 rounded-xl bg-yellow-300 text-emerald-950 font-bold text-lg hover:bg-yellow-200 disabled:opacity-40">Deal</button>
+        {broke && <p className="text-center text-red-300 text-sm mt-2">Bankroll too low — reset to continue.</p>}
+      </div>
+    );
+  }
+  if (phase === PHASE.SETTLE) {
+    return <button onClick={nextRound} className="w-full py-3 rounded-xl bg-yellow-300 text-emerald-950 font-bold text-lg hover:bg-yellow-200">Next Hand</button>;
+  }
+  const Btn = ({ action, label, cls, tip }) => (
+    <button onClick={()=>requestAction(action)} disabled={!legalActions[action]} title={tip} className={`py-3 rounded-xl font-bold text-white disabled:opacity-30 transition ${cls}`}>{label}</button>
+  );
+  const ring = (a) => (mode==='learn' && liveHint && liveHint.move===a) ? 'ring-2 ring-yellow-300' : '';
+  return (
+    <div>
+      {mode==='learn' && liveHint && (
+        <div className="mb-3 bg-emerald-900/60 border border-emerald-400/40 rounded-xl p-3">
+          <div className="text-[11px] uppercase tracking-wider text-emerald-200/80">Recommended</div>
+          <div className="text-lg font-bold text-yellow-300">{moveLabel(liveHint.move)}</div>
+          <p className="text-xs text-white/80 mt-1 leading-relaxed">{liveHint.explanation}</p>
+        </div>
+      )}
+      <div className="grid grid-cols-2 gap-2">
+        <Btn action="hit" label="Hit" tip="Take another card. Hit when your total is too low to compete with the dealer's likely hand." cls={`bg-sky-600 hover:bg-sky-500 ${ring('hit')}`} />
+        <Btn action="stand" label="Stand" tip="Take no more cards and end your turn. Stand when hitting risks busting more than it helps." cls={`bg-rose-600 hover:bg-rose-500 ${ring('stand')}`} />
+        <Btn action="double" label="Double" tip="Double your bet, take exactly one more card, then stand. Used on strong two-card totals (9–11) vs a weak dealer." cls={`bg-violet-600 hover:bg-violet-500 ${ring('double')}`} />
+        <Btn action="split" label="Split" tip="With a pair, split into two separate hands (each gets a second bet). Always split Aces and 8s." cls={`bg-amber-600 hover:bg-amber-500 ${ring('split')}`} />
+        <Btn action="surrender" label="Surrender" tip="Forfeit half your bet and give up the hand. Only on the first two cards, and only when the rule is enabled." cls={`col-span-2 bg-gray-600 hover:bg-gray-500 ${ring('surrender')}`} />
+      </div>
+    </div>
+  );
+}
+
+function Feedback({ feedback, onAck }) {
+  if (!feedback) return null;
+  if (feedback.correct) {
+    return <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-40 bg-emerald-600 text-white px-4 py-2 rounded-full shadow-lg text-sm font-semibold animate-deal">✓ {feedback.text}</div>;
+  }
+  return (
+    <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4">
+      <div className="bg-white rounded-2xl max-w-sm w-full p-5 shadow-2xl animate-deal">
+        <div className="text-red-600 font-bold text-lg mb-1">Not the book play</div>
+        <div className="text-sm text-gray-700 mb-3">You chose <b>{moveLabel(feedback.chose)}</b>. The correct play was <b className="text-emerald-700">{moveLabel(feedback.optimal)}</b>.</div>
+        <p className="text-sm text-gray-800 leading-relaxed bg-gray-100 rounded-lg p-3 mb-4">{feedback.text}</p>
+        <button onClick={onAck} className="w-full py-2.5 rounded-xl bg-emerald-600 text-white font-bold hover:bg-emerald-500">Got it — continue</button>
+      </div>
+    </div>
+  );
+}
+
+// --- Strategy chart ---
+const KIND_STYLES = {
+  hit: 'bg-rose-500/90',
+  stand: 'bg-emerald-500/90',
+  double: 'bg-sky-500/90',
+  split: 'bg-amber-400/90 text-emerald-950',
+  surrender: 'bg-gray-400/90 text-emerald-950',
+};
+// Build a lookup of where the player has missed: "section|rowKey|col" -> count.
+function buildMissMap(missList) {
+  const map = {};
+  (missList || []).forEach((m) => {
+    const [cat, playerKey, dealerLabel] = m.key.split('|');
+    const section = cat === 'pair' ? 'pairs' : cat;
+    const col = dealerLabel === 'Ace' ? 11 : Number(dealerLabel);
+    map[`${section}|${playerKey}|${col}`] = m.count;
+  });
+  return map;
+}
+function ChartGrid({ title, section, table, rules, missMap }) {
+  const rows = CHART_ROWS[section];
+  const head = section === 'pairs' ? 'Pair' : section === 'soft' ? 'Soft' : 'Hard';
+  return (
+    <div className="mb-4">
+      <h3 className="text-xs font-bold text-yellow-300 mb-1">{title}</h3>
+      <table className="border-collapse w-full table-fixed">
+        <thead>
+          <tr>
+            <th className="w-9 text-left text-[9px] text-white/50 font-semibold pb-0.5">{head}</th>
+            {DEALER_COLS.map((col)=>(<th key={col} className="text-[9px] text-white/50 font-semibold pb-0.5">{chartColLabel(col)}</th>))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((rk)=>(
+            <tr key={rk}>
+              <td className="text-[10px] text-white/80 font-semibold pr-1 whitespace-nowrap">{chartRowLabel(section, rk)}</td>
+              {DEALER_COLS.map((col)=>{
+                const cell = resolveChartCell(table[rk][col], rules);
+                const missed = missMap[`${section}|${rk}|${col}`];
+                return (
+                  <td key={col} className="p-px">
+                    <div className={`relative aspect-square w-full flex items-center justify-center rounded-sm font-bold text-[9px] sm:text-[10px] ${KIND_STYLES[cell.kind]} ${missed ? 'ring-2 ring-red-500 ring-inset' : ''}`}>
+                      {cell.label}
+                      {missed && (
+                        <span className="absolute -top-1 -right-1 min-w-[13px] h-[13px] px-0.5 bg-red-600 text-white rounded-full text-[8px] font-bold flex items-center justify-center leading-none">{missed}</span>
+                      )}
+                    </div>
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+function LegendChip({ kind, text }) {
+  return (
+    <span className="inline-flex items-center gap-1 mr-2 mb-1">
+      <span className={`w-3.5 h-3.5 rounded-sm ${KIND_STYLES[kind]}`} />
+      <span className="text-[11px] text-white/80">{text}</span>
+    </span>
+  );
+}
+function StrategyChart({ strategy, rules, missList }) {
+  const missMap = buildMissMap(missList);
+  const hasMisses = Object.keys(missMap).length > 0;
+  return (
+    <div>
+      <p className="text-[11px] text-white/60 mb-2">
+        Rows = your hand, columns = dealer upcard. Current rules:{' '}
+        <b className="text-white/80">{rules.decks}D · {rules.h17 ? 'H17' : 'S17'} · {rules.das ? 'DAS' : 'no DAS'} · {rules.surrender ? 'surr' : 'no surr'}{rules.noBust ? ' · no-bust' : ''}</b>
+      </p>
+      <div className="mb-3 flex flex-wrap items-center">
+        <LegendChip kind="hit" text="Hit" />
+        <LegendChip kind="stand" text="Stand" />
+        <LegendChip kind="double" text="Double" />
+        <LegendChip kind="split" text="Split" />
+        <LegendChip kind="surrender" text="Surr" />
+        {hasMisses && (
+          <span className="inline-flex items-center gap-1 mr-2 mb-1">
+            <span className="w-3.5 h-3.5 rounded-sm ring-2 ring-red-500 ring-inset" />
+            <span className="text-[11px] text-red-300">your misses (count)</span>
+          </span>
+        )}
+      </div>
+      <ChartGrid title="Hard totals" section="hard" table={strategy.hard} rules={rules} missMap={missMap} />
+      <ChartGrid title="Soft totals (Ace + card)" section="soft" table={strategy.soft} rules={rules} missMap={missMap} />
+      <ChartGrid title="Pairs" section="pairs" table={strategy.pairs} rules={rules} missMap={missMap} />
+      <p className="text-[10px] text-white/40">D = double else hit/stand. Totals 5–7 always hit; hard 18+ and 10,10 always stand — omitted for space.</p>
+    </div>
+  );
+}
+
+// --- Review panel ---
+function ReviewPanel({ missList, onPractice, onClear, minToReview }) {
+  const totalMisses = missList.reduce((s,m)=>s+m.count,0);
+
+  // Locked until enough mistakes have been collected to be meaningful.
+  if (totalMisses < minToReview) {
+    const pct = Math.round((totalMisses / minToReview) * 100);
+    return (
+      <div className="text-sm text-white/75">
+        <p className="mb-3">
+          Review unlocks after <b className="text-yellow-300">{minToReview}</b> mistakes so there's
+          a real pattern to work on. Keep playing in <b className="text-yellow-300">Quiz</b> mode.
+        </p>
+        <div className="flex justify-between text-xs text-white/60 mb-1">
+          <span>Mistakes collected</span><span>{totalMisses} / {minToReview}</span>
+        </div>
+        <div className="h-2 rounded bg-white/10 overflow-hidden">
+          <div className="h-full bg-yellow-300" style={{ width: `${pct}%` }} />
+        </div>
+        {totalMisses > 0 && (
+          <button onClick={onClear} className="mt-4 text-xs text-white/60 hover:text-white underline">Clear log</button>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div className="bg-yellow-300/10 border border-yellow-300/30 rounded-xl p-3 mb-4 flex items-center justify-between gap-3">
+        <div>
+          <div className="font-semibold text-sm text-yellow-100">Practice your mistakes</div>
+          <div className="text-[11px] text-white/60">Deals rotate through these {missList.length} situations, weighted by how often you miss them.</div>
+        </div>
+        <button onClick={onPractice} className="shrink-0 px-4 py-2 rounded-lg bg-yellow-300 text-emerald-950 text-sm font-bold hover:bg-yellow-200">Start</button>
+      </div>
+
+      <div className="flex items-center justify-between mb-2">
+        <p className="text-xs text-white/60">{totalMisses} mistakes across {missList.length} situation{missList.length===1?'':'s'}, worst first.</p>
+        <button onClick={onClear} className="text-xs text-white/60 hover:text-white underline">Clear log</button>
+      </div>
+      <div className="space-y-2">
+        {missList.map((m)=>{
+          const wrongMoves = Object.entries(m.chosen).sort((a,b)=>b[1]-a[1]).map(([mv])=>moveLabel(mv));
+          return (
+            <div key={m.key} className="bg-white/5 rounded-xl p-3">
+              <div className="font-semibold text-sm">{cap(m.playerLabel)} vs dealer {m.dealerLabel}
+                <span className="ml-2 text-xs text-rose-300">×{m.count} missed</span>
+              </div>
+              <div className="text-xs text-white/70 mt-0.5">Correct: <b className="text-emerald-300">{moveLabel(m.correctMove)}</b>
+                {wrongMoves.length > 0 && <span className="text-white/50"> · you played {wrongMoves.join(', ')}</span>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ================================= App ======================================
+function ModeBtn({ active, onClick, children }) {
+  return (
+    <button onClick={onClick} className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition ${active ? 'bg-yellow-300 text-emerald-950' : 'text-white/80 hover:text-white'}`}>{children}</button>
+  );
+}
+function ToolBtn({ onClick, children, title }) {
+  return (
+    <button onClick={onClick} title={title} className="px-3 py-1.5 rounded-xl bg-black/25 hover:bg-black/40 text-sm font-semibold text-white/90">{children}</button>
+  );
+}
+
+function App() {
+  const g = useGame();
+  const { PHASE } = g;
+  const [modal, setModal] = useState(null);
+  const close = () => setModal(null);
+  const totalMisses = g.missList.reduce((s, m) => s + m.count, 0);
+  const practiceFromReview = () => { g.startPractice(g.missList); close(); };
+
+  return (
+    <div className="min-h-full bg-gradient-to-b from-emerald-800 to-emerald-950 text-white">
+      <div className="max-w-5xl mx-auto px-3 py-4">
+        <header className="mb-4">
+          <div className="text-center mb-3">
+            <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight">Blackjack Trainer <span className="text-yellow-300">· By the Book</span></h1>
+            <p className="text-xs text-white/60">Basic strategy · Hi-Lo counting · bankroll & bet-sizing practice</p>
+          </div>
+          <div className="flex flex-wrap items-center justify-center gap-2">
+            <div className="inline-flex items-center rounded-xl bg-black/25 p-1">
+              <ModeBtn active={g.mode==='learn'} onClick={()=>g.setMode('learn')}>Learning</ModeBtn>
+              <ModeBtn active={g.mode==='quiz'} onClick={()=>g.setMode('quiz')}>Quiz</ModeBtn>
+              <span className="px-1.5 text-white/80"><InfoTip text="Learning shows the optimal move + reasoning before you act. Quiz hides it, grades you, and logs mistakes for Review." /></span>
+            </div>
+            <ToolBtn onClick={()=>setModal('chart')} title="Open the colour-coded basic-strategy chart (reflects your current rules; your mistakes are highlighted).">📊 Strategy Chart</ToolBtn>
+            <ToolBtn onClick={()=>setModal('review')} title="Review your most-missed situations and drill them. Unlocks after 10 mistakes.">📝 Review{totalMisses > 0 ? ` (${totalMisses})` : ''}</ToolBtn>
+            <ToolBtn onClick={()=>setModal('settings')} title="Casino rules: H17/S17, decks, DAS, surrender, and whether the bankroll panel shows.">⚙️ Settings</ToolBtn>
+          </div>
+        </header>
+
+        {g.practice && (
+          <div className="mb-3 flex items-center justify-between gap-3 bg-yellow-300/15 border border-yellow-300/40 rounded-xl px-4 py-2">
+            <span className="text-sm text-yellow-100">
+              🎯 Practicing <b>{g.practice.label}</b>
+              {g.currentDrill && <span className="text-yellow-200/80"> — this hand: {g.currentDrill.label}</span>}
+            </span>
+            <button onClick={g.exitPractice} className="shrink-0 text-xs px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/20">Exit drill</button>
+          </div>
+        )}
+
+        <div className="grid lg:grid-cols-[1fr_320px] gap-4">
+          <main className="order-2 lg:order-1">
+            <div className="bg-emerald-700/40 rounded-2xl border border-emerald-400/20 p-4 shadow-xl">
+              <Hand label="Dealer" cards={g.dealer.cards} hideHole={g.dealer.hideHole}
+                tip="The dealer's hand. One card stays face down until your turn ends. The dealer must hit to 17, then stand (and hits soft 17 if the H17 rule is on)." />
+              <div className="my-4 border-t border-dashed border-white/15" />
+              {g.playerHands.length === 0 ? (
+                <div className="text-center text-white/50 py-8 text-sm">Press <b className="text-yellow-300">Deal</b> to start a hand.</div>
+              ) : (
+                <div className={`grid gap-3 ${g.playerHands.length > 1 ? 'sm:grid-cols-2' : 'grid-cols-1'}`}>
+                  {g.playerHands.map((h, i) => (
+                    <Hand key={h.id}
+                      label={g.playerHands.length > 1 ? `Your hand ${i+1}` : 'Your hand'}
+                      cards={h.cards}
+                      active={g.phase === PHASE.PLAYER && i === g.activeIndex}
+                      result={g.phase === PHASE.SETTLE ? h.result : null}
+                      bet={g.rules.showBankroll ? h.bet : null} doubled={h.doubled}
+                      tip={i === 0 ? '"soft" means an Ace is counted as 11 (it can drop to 1 to avoid busting). Beat the dealer without going over 21.' : undefined} />
+                  ))}
+                </div>
+              )}
+              <div className="mt-4 text-center text-sm text-white/80 min-h-[20px]">{g.message}</div>
+              <div className="mt-4">
+                <Controls phase={g.phase} PHASE={PHASE} legalActions={g.legalActions}
+                  requestAction={g.requestAction} deal={g.deal} nextRound={g.nextRound}
+                  mode={g.mode} liveHint={g.liveHint} bankroll={g.bankroll} minBet={g.MIN_BET}
+                  showMoney={g.rules.showBankroll} />
+              </div>
+            </div>
+          </main>
+
+          <aside className="order-1 lg:order-2 space-y-3">
+            {g.rules.showBankroll && (
+              <BankrollBar bankroll={g.bankroll} bet={g.bet} setBet={g.setBet} phase={g.phase} PHASE={PHASE}
+                minBet={g.MIN_BET} trueCount={g.trueCount} accuracy={g.accuracy} stats={g.stats} onReset={g.resetBankroll} />
+            )}
+            {!g.rules.showBankroll && (
+              <div className="bg-black/25 rounded-xl p-3 text-white flex items-center justify-between">
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-white/60">Accuracy</div>
+                  <div className="text-2xl font-bold text-yellow-300">{g.accuracy == null ? '—' : `${g.accuracy}%`}</div>
+                  <div className="text-[10px] text-white/50">{g.stats.total} graded</div>
+                </div>
+                <button onClick={g.resetBankroll} className="text-xs px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/20">Reset stats</button>
+              </div>
+            )}
+            <CountDisplay runningCount={g.runningCount} trueCount={g.trueCount} decksLeft={g.decksLeft} shoe={g.shoe} />
+          </aside>
+        </div>
+
+        <footer className="text-center text-[11px] text-white/40 mt-6 pb-4">Educational tool — practice only. Strategy adapts live to the casino-rule toggles.</footer>
+      </div>
+
+      <Feedback feedback={g.feedback} onAck={g.acknowledgeFeedback} />
+      <Modal open={modal==='settings'} title="Settings & Casino Rules" onClose={close}><SettingsPanel rules={g.rules} updateRule={g.updateRule} /></Modal>
+      <Modal open={modal==='chart'} title="Basic Strategy Chart" onClose={close} maxWidth="max-w-md"><StrategyChart strategy={g.strategy} rules={g.rules} missList={g.missList} /></Modal>
+      <Modal open={modal==='review'} title="Review · Your Mistakes" onClose={close} maxWidth="max-w-xl"><ReviewPanel missList={g.missList} onPractice={practiceFromReview} onClear={g.clearMisses} minToReview={g.MIN_REVIEW_MISSES} /></Modal>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+
+  <!-- Bootstrap: transform the source with the classic runtime, then run it. -->
+  <script>
+    (function () {
+      var src = document.getElementById('app-src').textContent;
+      var out = Babel.transform(src, { presets: [['react', { runtime: 'classic' }]] }).code;
+      (0, eval)(out);
+    })();
+  </script>
+</body>
+</html>
